@@ -4,6 +4,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import sqlite3
+import csv
 import io
 import os
 from datetime import datetime
@@ -53,8 +54,9 @@ def save_records_to_db(df_records):
     for _, row in df_records.iterrows():
         try:
             p_val = float(row['price']) if pd.notna(row['price']) else None
-        except:
+        except Exception:
             p_val = None
+            
         cur.execute('''
             INSERT INTO material_prices (
                 subsidiary, category, material, grade, month, price, currency, supplier, memo, updated_at
@@ -86,63 +88,165 @@ def load_data_from_db():
     return df
 
 # ---------------------------------------------------------
-# 2. 엑셀 복사/붙여넣기 파싱 엔진 (Ctrl+C -> Ctrl+V)
+# 2. 초강력 엑셀 복사/붙여넣기 파싱 엔진 (ParserError 원천 방지)
 # ---------------------------------------------------------
-def parse_clipboard_text(pasted_text, sub_default="한국", curr_default="KRW"):
-    lines = [line for line in pasted_text.strip().splitlines() if line.strip()]
+def robust_parse_clipboard(pasted_text, sub_default="한국", curr_default="KRW"):
+    if not pasted_text or not pasted_text.strip():
+        return pd.DataFrame()
+
+    lines = [line.strip() for line in pasted_text.strip().splitlines() if line.strip()]
     if not lines:
         return pd.DataFrame()
+
+    # 탭 / 쉼표 구분자 자동 감지
+    first_few = lines[:min(5, len(lines))]
+    tab_count = sum(l.count('\t') for l in first_few)
+    comma_count = sum(l.count(',') for l in first_few)
+    sep = '\t' if tab_count >= comma_count else ','
+
+    # 엑셀 셀 내 줄바꿈, 따옴표, 불규칙 열 길이 완벽 대응 파서
+    try:
+        reader = csv.reader(io.StringIO(pasted_text), delimiter=sep)
+        raw_rows = [row for row in reader if any(cell.strip() for cell in row)]
+    except Exception:
+        raw_rows = [[c.strip() for c in l.split(sep)] for l in lines]
+
+    if not raw_rows:
+        return pd.DataFrame()
+
+    # 제목 줄(헤더) 행 자동 탐색
+    header_idx = 0
+    for idx, row in enumerate(raw_rows[:6]):
+        row_str = " ".join(row)
+        if any(keyword in row_str for keyword in ['재질', 'GRADE', 'Grade', '월', '단가', 'Material', 'Price', '구분']):
+            header_idx = idx
+            break
+
+    headers = [c.strip() for c in raw_rows[header_idx]]
+    data_rows = raw_rows[header_idx + 1:]
     
-    sep = '\t' if '\t' in lines[0] else ','
-    raw_df = pd.read_csv(io.StringIO(pasted_text), sep=sep)
-    raw_df.columns = [str(c).strip() for c in raw_df.columns]
+    if not data_rows:
+        return pd.DataFrame()
+
+    max_len = max(len(headers), max(len(r) for r in data_rows))
     
+    while len(headers) < max_len:
+        headers.append(f"열_{len(headers)+1}")
+    for i in range(len(headers)):
+        if not headers[i]:
+            headers[i] = f"열_{i+1}"
+
+    padded_data = []
+    for r in data_rows:
+        r_padded = [str(cell).strip() for cell in r]
+        while len(r_padded) < max_len:
+            r_padded.append('')
+        padded_data.append(r_padded[:max_len])
+
+    df = pd.DataFrame(padded_data, columns=headers[:max_len])
+
+    # 시세 월 컬럼 vs 부가정보 컬럼 자동 분별
     month_cols = []
     meta_cols = []
-    
-    for c in raw_df.columns:
-        if any(m in c for m in ['월', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', '202']):
-            month_cols.append(c)
-        elif c in ['법인', '구분', '재질', 'GRADE', 'Grade', '품목', '품목명', 'Material', '공급사', '공급사명', '통화', '결제통화', '비고', 'Memo']:
-            meta_cols.append(c)
+    for col in df.columns:
+        col_clean = str(col).strip()
+        if any(m in col_clean for m in ['월', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', '202']):
+            month_cols.append(col)
+        elif any(k in col_clean for k in ['구분', '재질', 'GRADE', 'Grade', '품목', 'Material', '공급사', '통화', '비고', 'Memo', '법인']):
+            meta_cols.append(col)
         else:
-            num_ratio = pd.to_numeric(raw_df[c].astype(str).str.replace(',', '').str.replace(' ', ''), errors='coerce').notna().mean()
-            if num_ratio > 0.4:
-                month_cols.append(c)
+            clean_s = df[col].astype(str).str.replace(',', '').str.replace(' ', '')
+            num_ratio = pd.to_numeric(clean_s, errors='coerce').notna().mean()
+            if num_ratio > 0.3:
+                month_cols.append(col)
             else:
-                meta_cols.append(c)
-                
+                meta_cols.append(col)
+
+    if not month_cols:
+        for col in reversed(df.columns):
+            if col not in meta_cols:
+                month_cols.append(col)
+                break
+
     records = []
-    for _, row in raw_df.iterrows():
-        mat = str(row.get('재질', row.get('품목', row.get('구분', row.get('Material', '기타소재'))))).strip()
-        cat = str(row.get('구분', mat)).strip()
-        grade = str(row.get('GRADE', row.get('Grade', 'STD'))).strip()
-        if grade in ['nan', '', 'None']:
-            grade = 'STD'
-        sub = str(row.get('법인', sub_default)).strip()
-        curr = str(row.get('통화', row.get('결제통화', curr_default))).strip()
-        supp = str(row.get('공급사', row.get('공급사명', ''))).strip()
-        memo = str(row.get('비고', row.get('Memo', ''))).strip()
-        
+    curr_cat = ""
+    curr_mat = ""
+
+    for _, row in df.iterrows():
+        # 구분
+        raw_cat = ""
+        for k in ['구분', 'Category']:
+            if k in row and str(row[k]).strip() != "":
+                raw_cat = str(row[k]).split('\n')[0].strip()
+                break
+        if raw_cat:
+            curr_cat = raw_cat
+
+        # 재질
+        raw_mat = ""
+        for k in ['재질', 'Material', '품목']:
+            if k in row and str(row[k]).strip() != "":
+                raw_mat = str(row[k]).split('\n')[0].strip()
+                break
+        if raw_mat:
+            curr_mat = raw_mat
+        elif not curr_mat and curr_cat:
+            curr_mat = curr_cat
+
+        # Grade
+        grade = "STD"
+        for k in ['GRADE', 'Grade', '그레이드']:
+            if k in row and str(row[k]).strip() not in ['', 'nan', 'None']:
+                grade = str(row[k]).strip()
+                break
+
+        # 법인
+        sub = sub_default
+        for k in ['법인', 'Subsidiary']:
+            if k in row and str(row[k]).strip() != "":
+                sub = str(row[k]).strip()
+                break
+
+        # 통화
+        curr = curr_default
+        for k in ['통화', '결제통화', 'Currency']:
+            if k in row and str(row[k]).strip() != "":
+                curr = str(row[k]).strip()
+                break
+
+        # 공급사
+        supp = ""
+        for k in ['공급사', '공급사명', 'Supplier']:
+            if k in row and str(row[k]).strip() not in ['', 'nan']:
+                supp = str(row[k]).strip()
+                break
+
+        # 비고
+        memo = ""
+        for k in ['비고', 'Memo']:
+            if k in row and str(row[k]).strip() not in ['', 'nan']:
+                memo = str(row[k]).strip()
+                break
+
         for m in month_cols:
             val = row[m]
             try:
                 p_val = float(str(val).replace(',', '').strip())
-            except:
+            except Exception:
                 p_val = np.nan
-                
+
             records.append({
                 'subsidiary': sub,
-                'category': cat,
-                'material': mat,
+                'category': curr_cat if curr_cat else '원소재',
+                'material': curr_mat if curr_mat else '주요품목',
                 'grade': grade,
-                'month': m,
+                'month': str(m).strip(),
                 'price': p_val,
                 'currency': curr,
-                'supplier': supp if supp != 'nan' else '',
-                'memo': memo if memo != 'nan' else ''
+                'supplier': supp,
+                'memo': memo
             })
-            
+
     return pd.DataFrame(records)
 
 # ---------------------------------------------------------
@@ -182,7 +286,7 @@ def parse_raw_material_excel(uploaded_file):
                     memo = df_summary.iloc[r, col_idx + 3]
                     try:
                         p_val = float(price) if pd.notna(price) else None
-                    except:
+                    except Exception:
                         p_val = None
                     records.append({
                         'subsidiary': sub,
@@ -214,7 +318,7 @@ def parse_raw_material_excel(uploaded_file):
                 memo = df_in.iloc[r, col_idx + 3]
                 try:
                     p_val = float(price) if pd.notna(price) else None
-                except:
+                except Exception:
                     p_val = None
                 records.append({
                     'subsidiary': '인도',
@@ -245,15 +349,15 @@ if df_db.empty:
             break
 
 # ---------------------------------------------------------
-# 5. 데이터 입력 탭 (엑셀 복사/붙여넣기 vs 모바일 파일 업로드)
+# 5. UI: 데이터 입력 (붙여넣기 vs 업로드)
 # ---------------------------------------------------------
-st.title("📊 글로벌 법인별 원소재 단가 Trend 분석 대시보드")
+st.title("📊 글로벌 법인별 원소재 단가 Trend 분석기")
 st.caption("사출수지, 비철금속(Cu, Al, 황동) 월별 시세 추이 모니터링 & DB 누적 관리")
 
 input_tab1, input_tab2 = st.tabs(["📋 엑셀 데이터 직접 붙여넣기 (사내망/보안 환경용)", "📁 엑셀 파일 업로드 (모바일/기타)"])
 
 with input_tab1:
-    st.info("💡 **사용법**: 사내 엑셀에서 단가 표 영역을 드래그하여 **복사(Ctrl+C)**한 후, 아래 입력창에 **붙여넣기(Ctrl+V)**하세요.")
+    st.info("💡 **간편 사용법**: 사내 엑셀에서 단가 표 영역을 드래그하여 **복사(Ctrl+C)**한 후, 아래 입력창에 **붙여넣기(Ctrl+V)**하세요. 병합 셀이나 줄바꿈이 있어도 자동 정제됩니다.")
     p_col1, p_col2 = st.columns(2)
     with p_col1:
         paste_sub = st.selectbox("기본 법인 지정", ["한국", "인도", "중국"], index=0)
@@ -262,19 +366,19 @@ with input_tab1:
         
     pasted_text = st.text_area(
         "엑셀 표 붙여넣기 창",
-        placeholder="예시:\n재질\tGRADE\t7월\t8월\t9월\nPP-TD20\tJF1512\t2015\t1765\t1785\nALDC12\tSTD\t5376\t5148\t4777",
+        placeholder="엑셀에서 복사(Ctrl+C)한 표를 여기에 붙여넣기(Ctrl+V)하세요...",
         height=140
     )
     
     if st.button("🚀 붙여넣은 데이터로 즉시 차트 반영 & DB 누적 저장"):
         if pasted_text.strip():
-            parsed_paste_df = parse_clipboard_text(pasted_text, sub_default=paste_sub, curr_default=paste_curr)
+            parsed_paste_df = robust_parse_clipboard(pasted_text, sub_default=paste_sub, curr_default=paste_curr)
             if not parsed_paste_df.empty:
                 saved = save_records_to_db(parsed_paste_df)
-                st.success(f"총 {saved}건의 시세 데이터가 누적 DB에 정상 저장되었습니다.")
+                st.success(f"총 {saved}건의 시세 데이터가 정제되어 누적 DB에 정상 저장되었습니다.")
                 df_db = load_data_from_db()
             else:
-                st.error("데이터 파싱에 실패했습니다. 엑셀의 열 제목(재질, 월 등)을 포함하여 복사했는지 확인해주세요.")
+                st.error("데이터 파싱에 실패했습니다. 복사한 영역에 열 제목이나 수치가 포함되어 있는지 확인해주세요.")
         else:
             st.warning("붙여넣은 내용이 없습니다. 엑셀에서 복사 후 입력해주세요.")
 
@@ -293,18 +397,16 @@ if not df_db.empty:
         st.warning("⚠️ **[구매 현황 안내] 중국 법인 원소재 단가는 현재 미접수 상태입니다.** 데이터 접수 시 복사·붙여넣기로 추가하면 통합 반영됩니다.")
 
 # ---------------------------------------------------------
-# 6. 사이드바: 재질별 드롭다운 및 필터 설정 (변수 안전 초기화)
+# 6. 사이드바: 재질별 드롭다운 및 필터 설정
 # ---------------------------------------------------------
 st.sidebar.markdown("## 🔍 시세 조회 조건")
 
-# 기본값 선언 (NameError 방지)
 selected_material = "전체 재질"
 selected_subs = []
 selected_grades = []
 final_df = pd.DataFrame()
 
 if not df_db.empty:
-    # 1) 재질 드롭다운
     material_list = sorted([m for m in df_db['material'].dropna().unique() if str(m).strip() != ''])
     selected_material = st.sidebar.selectbox(
         "📌 재질(Material) 선택",
@@ -312,7 +414,6 @@ if not df_db.empty:
         index=0
     )
     
-    # 2) 법인 필터
     subs_list = list(df_db['subsidiary'].unique())
     selected_subs = st.sidebar.multiselect(
         "🏢 대상 법인 선택",
@@ -320,13 +421,11 @@ if not df_db.empty:
         default=[s for s in ['한국', '인도'] if s in subs_list]
     )
     
-    # 1차 필터링
     mask = df_db['subsidiary'].isin(selected_subs)
     if selected_material != "전체 재질":
         mask = mask & (df_db['material'] == selected_material)
     sub_filtered = df_db[mask]
     
-    # 3) 세부 GRADE 필터
     grade_list = sorted([g for g in sub_filtered['grade'].dropna().unique() if str(g).strip() != ''])
     selected_grades = st.sidebar.multiselect(
         "🏷️ GRADE 선택",
