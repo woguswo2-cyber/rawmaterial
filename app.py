@@ -4,6 +4,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import sqlite3
+import csv
 import re
 import io
 import os
@@ -88,7 +89,6 @@ def save_records_to_db(df_records):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     count = 0
     for _, row in df_records.iterrows():
-        # 화이트리스트에 없는 찌꺼기 데이터 차단
         if row['material_name'] not in STANDARDIZED_MATERIALS:
             continue
         try:
@@ -127,7 +127,7 @@ def load_data_from_db():
     return df
 
 # ---------------------------------------------------------
-# 3. 엑셀 원본 파일 파서 (한국/인도 완전 자동 매핑)
+# 3. 엑셀 원본 파일 파서 (한국/인도 엑셀 자동 매핑)
 # ---------------------------------------------------------
 def parse_raw_material_excel(uploaded_file):
     excel = pd.ExcelFile(uploaded_file)
@@ -136,7 +136,6 @@ def parse_raw_material_excel(uploaded_file):
     if '요약_Summary' in excel.sheet_names:
         df = pd.read_excel(excel, sheet_name='요약_Summary', header=None)
         
-        # 엑셀 요약 시트 행 매핑 (0-index 기준 정확한 행 지정)
         exact_mapping = {
             6: ("1. Cu", "Cu"),
             9: ("2. ALDC 12", "ALDC 12"),
@@ -198,93 +197,98 @@ def parse_raw_material_excel(uploaded_file):
     return pd.DataFrame(records)
 
 # ---------------------------------------------------------
-# 4. 복사/붙여넣기 파서 (화이트리스트 정제)
+# 4. 초강력 복사/붙여넣기 파서 (인도 루피 기호/줄바꿈 완벽 지원)
 # ---------------------------------------------------------
 def parse_smart_excel_clipboard(pasted_text, sub_default="한국"):
-    lines = [l for l in pasted_text.strip().splitlines() if l.strip()]
-    if not lines:
+    if not pasted_text or not pasted_text.strip():
         return pd.DataFrame()
 
     sep = '\t' if '\t' in pasted_text else ','
-    rows = [[c.strip() for c in l.split(sep)] for l in lines]
-    records = []
+    try:
+        reader = csv.reader(io.StringIO(pasted_text), delimiter=sep)
+        rows = [r for r in reader if any(c.strip() for c in r)]
+    except Exception:
+        rows = [[c.strip() for c in l.split(sep)] for l in pasted_text.strip().splitlines() if l.strip()]
 
-    # 표준 이름 매핑기
-    def get_matched_std(text):
-        t = text.upper()
-        if "JF1512" in t: return "3. 사출 원재료", "PP-TD20 (JF1512)"
-        if "JF1514" in t: return "3. 사출 원재료", "PP-TD+GF (JF1514G10)"
-        if "JF5513" in t: return "3. 사출 원재료", "PP-GF30% (JF5513)"
-        if "G-152" in t or "G152" in t: return "3. 사출 원재료", "PP-GF20 (G-152)"
-        if "G-153B" in t or "G153B" in t: return "3. 사출 원재료", "PP-GF30 (G-153B)"
-        if "JI350N" in t: return "3. 사출 원재료", "PP (JI350N)"
-        if "JI350G" in t: return "3. 사출 원재료", "PP (JI350G)"
-        if "KN333" in t: return "3. 사출 원재료", "PA66-GF30 (KN333G30BL)"
-        if "KP213" in t: return "3. 사출 원재료", "PBT-GF30 (KP213G30BL)"
-        if "LGP2200-BK" in t: return "3. 사출 원재료", "PP-GF20 (LGP2200-BK)"
-        if "LGP2200-NP" in t: return "3. 사출 원재료", "PP-GF20 (LGP2200-NP)"
-        if "LGP2100" in t: return "3. 사출 원재료", "PP-GF10 (LGP2100-NP)"
-        if "C1100" in t or "황동" in t or "BRASS" in t: return "4. 황동 원소재", "황동 C1100"
-        if "ALDC" in t or "알루미늄" in t: return "2. ALDC 12", "ALDC 12"
-        if "SN" in t or "주석" in t: return "5. Sn", "Sn"
-        if "CU" in t or "구리" in t or "동" in t: return "1. Cu", "Cu"
-        return None, None
+    default_months = ["7월", "8월", "9월", "10월", "11월", "12월"]
+    records = []
 
     for row in rows:
         if not any(row):
             continue
-        first_num_idx = -1
+
+        # 모든 셀에서 통화 기호(₹, ₩, $, ¥) 및 쉼표 제거 후 숫자 추출
+        price_cells = []
         for i, cell in enumerate(row):
-            clean = cell.replace(',', '').replace(' ', '')
-            try:
-                val = float(clean)
-                if val > 0:
-                    first_num_idx = i
-                    break
-            except Exception:
-                pass
-        if first_num_idx == -1:
+            clean = re.sub(r'[^\d.]', '', str(cell))
+            if clean and clean != '.':
+                try:
+                    val = float(clean)
+                    if val > 0:
+                        price_cells.append((i, val, str(cell)))
+                except:
+                    pass
+
+        if not price_cells:
             continue
 
-        name_part = " ".join([c.split('/')[0].strip() for c in row[:first_num_idx] if c.strip()])
-        cat, mat = get_matched_std(name_part)
-        if not mat:
+        # 첫 번째 숫자 앞에 있는 셀들을 원소재 이름으로 인식
+        first_num_idx = price_cells[0][0]
+        name_tokens = [c.split('/')[0].strip() for c in row[:first_num_idx] if c.strip()]
+        name_str = " ".join(name_tokens).upper()
+
+        std_cat, std_mat = None, None
+        if "CU" in name_str or "구리" in name_str or "동" in name_str: std_cat, std_mat = "1. Cu", "Cu"
+        elif "ALDC" in name_str or "알루미늄" in name_str: std_cat, std_mat = "2. ALDC 12", "ALDC 12"
+        elif "JF1512" in name_str or "PP-TD20" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP-TD20 (JF1512)"
+        elif "JF1514" in name_str or "TD+GF" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP-TD+GF (JF1514G10)"
+        elif "JF5513" in name_str or "GF30%" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP-GF30% (JF5513)"
+        elif "G-152" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP-GF20 (G-152)"
+        elif "G-153B" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP-GF30 (G-153B)"
+        elif "JI350N" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP (JI350N)"
+        elif "JI350G" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP (JI350G)"
+        elif "KN333" in name_str or "PA66-GF30" in name_str: std_cat, std_mat = "3. 사출 원재료", "PA66-GF30 (KN333G30BL)"
+        elif "KP213" in name_str or "PBT-GF30" in name_str: std_cat, std_mat = "3. 사출 원재료", "PBT-GF30 (KP213G30BL)"
+        elif "LGP2200-BK" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP-GF20 (LGP2200-BK)"
+        elif "LGP2200-NP" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP-GF20 (LGP2200-NP)"
+        elif "LGP2100" in name_str: std_cat, std_mat = "3. 사출 원재료", "PP-GF10 (LGP2100-NP)"
+        elif "C1100" in name_str or "황동" in name_str or "BRASS" in name_str: std_cat, std_mat = "4. 황동 원소재", "황동 C1100"
+        elif "SN" in name_str or "주석" in name_str: std_cat, std_mat = "5. Sn", "Sn"
+
+        if not std_mat:
             continue
 
-        val_part = row[first_num_idx:]
-        months = ["7월", "8월", "9월", "10월", "11월", "12월"]
-        idx = 0
-        m_count = 0
-        while idx < len(val_part):
-            cell = val_part[idx]
-            clean = cell.replace(',', '').replace(' ', '')
-            try:
-                p_val = float(clean)
-                curr = "KRW" if sub_default == "한국" else ("INR" if sub_default == "인도" else "CNY")
-                supp = ""
-                if idx + 1 < len(val_part) and val_part[idx+1] in ['KRW', 'USD', 'INR', 'CNY']:
-                    curr = val_part[idx+1]
-                    if idx + 2 < len(val_part) and not any(c.isdigit() for c in val_part[idx+2]):
-                        supp = val_part[idx+2]
-                        idx += 3
-                    else:
-                        idx += 2
-                else:
-                    idx += 1
+        for m_idx, (col_idx, p_val, raw_cell) in enumerate(price_cells):
+            curr = "INR" if sub_default == "인도" else ("KRW" if sub_default == "한국" else "CNY")
+            if "₹" in raw_cell or "INR" in raw_cell: curr = "INR"
+            elif "₩" in raw_cell or "KRW" in raw_cell: curr = "KRW"
+            elif "¥" in raw_cell or "CNY" in raw_cell: curr = "CNY"
+            elif "$" in raw_cell or "USD" in raw_cell: curr = "USD"
+            elif col_idx + 1 < len(row) and row[col_idx + 1] in ['KRW', 'INR', 'USD', 'CNY']:
+                curr = row[col_idx + 1]
 
-                m_label = months[m_count] if m_count < len(months) else f"{m_count+1}차"
-                records.append({
-                    '법인': sub_default,
-                    'std_category': cat,
-                    'material_name': mat,
-                    '월': m_label,
-                    '단가': p_val,
-                    '통화': curr,
-                    '공급사': supp
-                })
-                m_count += 1
-            except Exception:
-                idx += 1
+            supp = ""
+            for check_idx in [col_idx + 1, col_idx + 2, col_idx + 3]:
+                if check_idx < len(row):
+                    txt = row[check_idx]
+                    if any(kw in txt for kw in ['M/s.', 'Hindalco', 'Supplier', '평화', '상농', '롯데', 'BGF', '원영', '한국특산', '옥성', '케미칼']):
+                        m = re.search(r'M/s\.\s*([^-\n\r]+)', txt)
+                        if m:
+                            supp = m.group(1).strip()
+                        else:
+                            supp = txt.split('\n')[0].replace('RM SUPPLIER Name :', '').replace('RM Supplier -', '').strip()
+                        break
+
+            m_label = default_months[m_idx] if m_idx < len(default_months) else f"{m_idx+1}차"
+            records.append({
+                '법인': sub_default,
+                'std_category': std_cat,
+                'material_name': std_mat,
+                '월': m_label,
+                '단가': p_val,
+                '통화': curr,
+                '공급사': supp
+            })
 
     return pd.DataFrame(records)
 
@@ -293,10 +297,7 @@ def parse_smart_excel_clipboard(pasted_text, sub_default="한국"):
 # ---------------------------------------------------------
 init_db()
 
-# DB 데이터 조회
 df_db = load_data_from_db()
-
-# 최초 실행 시 기본 파일에서 자동 시드
 if df_db.empty:
     for default_name in ["[인도법인]법인별 원소재 가격 추이_260930_KR-EN R1.xlsx", "raw_material_sample.xlsx"]:
         if os.path.exists(default_name):
@@ -306,11 +307,13 @@ if df_db.empty:
             break
 
 # ---------------------------------------------------------
-# 6. 사이드바: 드롭다운 및 기간 설정
+# 6. 사이드바: 법인 / 원소재 재질 드롭다운 / 기간 필터
 # ---------------------------------------------------------
 st.sidebar.markdown("## ⚙️ 시세 조회 설정")
 
-# 1) 원소재 재질 드롭다운 (화이트리스트 순서 유지)
+subs_options = ["전체 법인 (비교)", "한국", "인도", "중국"]
+selected_sub_filter = st.sidebar.selectbox("🏢 법인 조회 범위", subs_options, index=0)
+
 available_mats = [m for m in STANDARDIZED_MATERIALS if m in df_db['material_name'].unique()]
 mat_options = ["전체 원소재 현황"] + (available_mats if available_mats else STANDARDIZED_MATERIALS)
 
@@ -320,7 +323,6 @@ selected_material = st.sidebar.selectbox(
     index=0
 )
 
-# 2) 기간 설정 필터
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📅 기간 설정")
 month_order = {'1월': 1, '2월': 2, '3월': 3, '4월': 4, '5월': 5, '6월': 6,
@@ -329,7 +331,12 @@ month_order = {'1월': 1, '2월': 2, '3월': 3, '4월': 4, '5월': 5, '6월': 6,
 all_months = sorted(df_db['month'].unique(), key=lambda x: month_order.get(x, 99)) if not df_db.empty else ['7월', '8월', '9월']
 selected_months = st.sidebar.multiselect("조회 대상 월 선택", options=all_months, default=all_months)
 
-working_df = df_db[df_db['month'].isin(selected_months)].copy() if not df_db.empty else pd.DataFrame()
+working_df = df_db.copy()
+if selected_sub_filter != "전체 법인 (비교)":
+    working_df = working_df[working_df['subsidiary'] == selected_sub_filter]
+
+if selected_months:
+    working_df = working_df[working_df['month'].isin(selected_months)]
 
 # ---------------------------------------------------------
 # 7. 메인 화면: 엑셀 복사/붙여넣기 창
@@ -337,8 +344,8 @@ working_df = df_db[df_db['month'].isin(selected_months)].copy() if not df_db.emp
 st.title("📊 글로벌 원소재 단가 누적 Trend 대시보드")
 
 with st.expander("📋 사내 엑셀 단가표 복사·붙여넣기 (클릭하여 열기)", expanded=False):
-    st.info("💡 **사용법**: 엑셀 표를 복사(Ctrl+C) 후 아래에 붙여넣기(Ctrl+V)하세요. 표준 5대 원소재만 필터링되어 DB에 저장됩니다.")
-    p_sub = st.selectbox("붙여넣을 대상 법인", ["한국", "인도", "중국"], index=0)
+    st.info("💡 **사용법**: 엑셀 표를 복사(Ctrl+C) 후 아래에 붙여넣기(Ctrl+V)하세요. 루피(₹)나 원화(₩) 기호가 섞여 있어도 자동으로 정확한 단가만 인식됩니다.")
+    p_sub = st.selectbox("붙여넣을 대상 법인", ["인도", "한국", "중국"], index=0)
     pasted_text = st.text_area("엑셀 붙여넣기 창", height=100, placeholder="엑셀 복사 데이터를 여기에 붙여넣으세요...")
     if st.button("🚀 데이터 반영 & DB 누적 저장"):
         if pasted_text.strip():
@@ -349,8 +356,9 @@ with st.expander("📋 사내 엑셀 단가표 복사·붙여넣기 (클릭하�
                 st.rerun()
             else:
                 st.error("지정된 5대 표준 원소재(Cu, ALDC12, 사출수지 등) 단가를 찾을 수 없습니다.")
+        else:
+            st.warning("붙여넣은 내용이 없습니다.")
 
-# 중국 법인 미접수 안내 배너
 if not df_db.empty:
     cn_prices = df_db[(df_db['subsidiary'] == '중국') & (df_db['price'].notna())]
     if cn_prices.empty:
@@ -361,7 +369,6 @@ if not df_db.empty:
 # ---------------------------------------------------------
 st.subheader(f"📈 {selected_material} 단가 Trend (재질별 개별 그래프 & 법인별 비교)")
 
-# 표시할 품목 리스트
 if selected_material == "전체 원소재 현황":
     materials_to_show = [m for m in STANDARDIZED_MATERIALS if m in working_df['material_name'].unique()]
 else:
@@ -386,7 +393,6 @@ if materials_to_show and not working_df.empty:
                     mat_data['month_rank'] = mat_data['month'].map(lambda x: month_order.get(x, 99))
                     mat_data = mat_data.sort_values(by=['month_rank', 'subsidiary'])
                     
-                    # 툴팁에 표시할 통화기호 + 금액 포맷팅
                     mat_data['fmt_price'] = mat_data.apply(lambda r: format_price_label(r['price'], r['currency']), axis=1)
                     mat_data['disp_supplier'] = mat_data['supplier'].apply(lambda s: s if s else "-")
                     
@@ -401,7 +407,6 @@ if materials_to_show and not working_df.empty:
                         custom_data=['subsidiary', 'fmt_price', 'disp_supplier']
                     )
                     
-                    # 세 번째 사진 개선: 통화 기호 표기랑 숫자, 공급처만 깔끔하게 노출
                     fig.update_traces(
                         line=dict(width=2.5),
                         marker=dict(size=8),
