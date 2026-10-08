@@ -51,7 +51,10 @@ def save_records_to_db(df_records):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     count = 0
     for _, row in df_records.iterrows():
-        p_val = float(row['price']) if pd.notna(row['price']) else None
+        try:
+            p_val = float(row['price']) if pd.notna(row['price']) else None
+        except:
+            p_val = None
         cur.execute('''
             INSERT INTO material_prices (
                 subsidiary, category, material, grade, month, price, currency, supplier, memo, updated_at
@@ -74,8 +77,12 @@ def save_records_to_db(df_records):
 
 def load_data_from_db():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM material_prices ORDER BY category, material, grade, month", conn)
-    conn.close()
+    try:
+        df = pd.read_sql_query("SELECT * FROM material_prices ORDER BY category, material, grade, month", conn)
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
     return df
 
 # ---------------------------------------------------------
@@ -86,12 +93,10 @@ def parse_clipboard_text(pasted_text, sub_default="한국", curr_default="KRW"):
     if not lines:
         return pd.DataFrame()
     
-    # 탭(\t) 또는 쉼표(,) 구분자 감지
     sep = '\t' if '\t' in lines[0] else ','
     raw_df = pd.read_csv(io.StringIO(pasted_text), sep=sep)
     raw_df.columns = [str(c).strip() for c in raw_df.columns]
     
-    # 시세 월 컬럼 vs 기본 정보 컬럼 자동 분류
     month_cols = []
     meta_cols = []
     
@@ -101,7 +106,6 @@ def parse_clipboard_text(pasted_text, sub_default="한국", curr_default="KRW"):
         elif c in ['법인', '구분', '재질', 'GRADE', 'Grade', '품목', '품목명', 'Material', '공급사', '공급사명', '통화', '결제통화', '비고', 'Memo']:
             meta_cols.append(c)
         else:
-            # 수치 데이터 비율이 높으면 시세 월 컬럼으로 자동 판정
             num_ratio = pd.to_numeric(raw_df[c].astype(str).str.replace(',', '').str.replace(' ', ''), errors='coerce').notna().mean()
             if num_ratio > 0.4:
                 month_cols.append(c)
@@ -110,7 +114,6 @@ def parse_clipboard_text(pasted_text, sub_default="한국", curr_default="KRW"):
                 
     records = []
     for _, row in raw_df.iterrows():
-        # 재질 및 구분 감지
         mat = str(row.get('재질', row.get('품목', row.get('구분', row.get('Material', '기타소재'))))).strip()
         cat = str(row.get('구분', mat)).strip()
         grade = str(row.get('GRADE', row.get('Grade', 'STD'))).strip()
@@ -228,11 +231,10 @@ def parse_raw_material_excel(uploaded_file):
     return pd.DataFrame(records)
 
 # ---------------------------------------------------------
-# 4. App Execution & DB Initial Setup
+# 4. App Execution & Initial Data Load
 # ---------------------------------------------------------
 init_db()
 
-# DB가 비어있는 경우 기본 엑셀이 있으면 자동 시드
 df_db = load_data_from_db()
 if df_db.empty:
     for default_name in ["[인도법인]법인별 원소재 가격 추이_260930_KR-EN R1.xlsx", "raw_material_sample.xlsx"]:
@@ -261,7 +263,7 @@ with input_tab1:
     pasted_text = st.text_area(
         "엑셀 표 붙여넣기 창",
         placeholder="예시:\n재질\tGRADE\t7월\t8월\t9월\nPP-TD20\tJF1512\t2015\t1765\t1785\nALDC12\tSTD\t5376\t5148\t4777",
-        height=150
+        height=140
     )
     
     if st.button("🚀 붙여넣은 데이터로 즉시 차트 반영 & DB 누적 저장"):
@@ -269,10 +271,10 @@ with input_tab1:
             parsed_paste_df = parse_clipboard_text(pasted_text, sub_default=paste_sub, curr_default=paste_curr)
             if not parsed_paste_df.empty:
                 saved = save_records_to_db(parsed_paste_df)
-                st.success(f"성공! 총 {saved}건의 시세 데이터가 누적 DB에 저장되었습니다.")
+                st.success(f"총 {saved}건의 시세 데이터가 누적 DB에 정상 저장되었습니다.")
                 df_db = load_data_from_db()
             else:
-                st.error("데이터 파싱에 실패했습니다. 엑셀의 헤더(재질, 월 등)를 포함하여 복사했는지 확인해주세요.")
+                st.error("데이터 파싱에 실패했습니다. 엑셀의 열 제목(재질, 월 등)을 포함하여 복사했는지 확인해주세요.")
         else:
             st.warning("붙여넣은 내용이 없습니다. 엑셀에서 복사 후 입력해주세요.")
 
@@ -291,13 +293,19 @@ if not df_db.empty:
         st.warning("⚠️ **[구매 현황 안내] 중국 법인 원소재 단가는 현재 미접수 상태입니다.** 데이터 접수 시 복사·붙여넣기로 추가하면 통합 반영됩니다.")
 
 # ---------------------------------------------------------
-# 6. 사이드바: 재질별 드롭다운 및 필터 설정
+# 6. 사이드바: 재질별 드롭다운 및 필터 설정 (변수 안전 초기화)
 # ---------------------------------------------------------
 st.sidebar.markdown("## 🔍 시세 조회 조건")
 
+# 기본값 선언 (NameError 방지)
+selected_material = "전체 재질"
+selected_subs = []
+selected_grades = []
+final_df = pd.DataFrame()
+
 if not df_db.empty:
     # 1) 재질 드롭다운
-    material_list = sorted([m for m in df_db['material'].dropna().unique() if m != ''])
+    material_list = sorted([m for m in df_db['material'].dropna().unique() if str(m).strip() != ''])
     selected_material = st.sidebar.selectbox(
         "📌 재질(Material) 선택",
         options=["전체 재질"] + material_list,
@@ -319,7 +327,7 @@ if not df_db.empty:
     sub_filtered = df_db[mask]
     
     # 3) 세부 GRADE 필터
-    grade_list = sorted(sub_filtered['grade'].unique())
+    grade_list = sorted([g for g in sub_filtered['grade'].dropna().unique() if str(g).strip() != ''])
     selected_grades = st.sidebar.multiselect(
         "🏷️ GRADE 선택",
         options=grade_list,
@@ -327,25 +335,22 @@ if not df_db.empty:
     )
     
     final_df = sub_filtered[sub_filtered['grade'].isin(selected_grades)].copy()
-else:
-    final_df = pd.DataFrame()
 
 st.markdown("---")
 
 # ---------------------------------------------------------
 # 7. Trend 꺾은선 그래프
 # ---------------------------------------------------------
-st.subheader(f"📈 {'[' + selected_material + ']' if selected_material != '전체 재질' else '주요 원소재'} 단가 변동 Trend (꺾은선 그래프)")
+trend_title = f"[{selected_material}] 단가 변동 Trend (꺾은선 그래프)" if selected_material != "전체 재질" else "주요 원소재 단가 변동 Trend (꺾은선 그래프)"
+st.subheader(f"📈 {trend_title}")
 
-valid_plot_df = final_df.dropna(subset=['price']).copy()
+valid_plot_df = final_df.dropna(subset=['price']).copy() if not final_df.empty else pd.DataFrame()
 
 if not valid_plot_df.empty:
-    # 월 순서 정렬 매핑
     month_order = {'7월': 1, '8월': 2, '9월': 3, '10월': 4, '11월': 5, '12월': 6}
     valid_plot_df['month_rank'] = valid_plot_df['month'].map(lambda x: month_order.get(x, 99))
     valid_plot_df = valid_plot_df.sort_values(by=['month_rank', 'subsidiary', 'material', 'grade'])
     
-    # 라벨 포맷
     valid_plot_df['line_label'] = valid_plot_df.apply(
         lambda r: f"[{r['subsidiary']}] {r['material']} | {r['grade']} ({r['currency']})", axis=1
     )
@@ -386,7 +391,7 @@ if not valid_plot_df.empty:
     fig.update_traces(line=dict(width=2.5), marker=dict(size=8))
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("조회할 유효 단가 데이터가 없습니다. 상단에서 엑셀 데이터를 붙여넣거나 필터를 조정하세요.")
+    st.info("조회할 단가 데이터가 아직 없습니다. 상단에서 엑셀 표를 복사·붙여넣기하거나 파일을 업로드해주세요.")
 
 # ---------------------------------------------------------
 # 8. 세부 단가 피벗 테이블 및 MoM 증감율
@@ -401,23 +406,20 @@ if not final_df.empty:
         aggfunc='first'
     ).reset_index()
     
-    cols = [c for c in ['7월', '8월', '9월', '10월'] if c in pivot_df.columns]
+    cols = [c for c in ['7월', '8월', '9월', '10월', '11월', '12월'] if c in pivot_df.columns]
+    format_dict = {c: '{:,.2f}' for c in cols}
+    
     if len(cols) >= 2:
         prev_m, curr_m = cols[-2], cols[-1]
-        pivot_df[f'MoM 증감 ({curr_m} vs {prev_m})'] = pivot_df[curr_m] - pivot_df[prev_m]
-        pivot_df['MoM 증감률(%)'] = ((pivot_df[curr_m] - pivot_df[prev_m]) / pivot_df[prev_m]) * 100
+        diff_col = f'MoM 증감 ({curr_m} vs {prev_m})'
+        rate_col = 'MoM 증감률(%)'
+        pivot_df[diff_col] = pivot_df[curr_m] - pivot_df[prev_m]
+        pivot_df[rate_col] = ((pivot_df[curr_m] - pivot_df[prev_m]) / pivot_df[prev_m]) * 100
+        format_dict[diff_col] = '{:+,.2f}'
+        format_dict[rate_col] = '{:+.2f}%'
         
-    st.dataframe(
-        pivot_df.style.format({
-            c: '{:,.2f}' for c in cols
-        } | {
-            f'MoM 증감 ({curr_m} vs {prev_m})': '{:+,.2f}',
-            'MoM 증감률(%)': '{:+.2f}%'
-        }, na_rep="-"),
-        use_container_width=True
-    )
+    st.dataframe(pivot_df.style.format(format_dict, na_rep="-"), use_container_width=True)
     
-    # 안전한 엑셀 백업 다운로드
     out_buf = io.BytesIO()
     with pd.ExcelWriter(out_buf, engine='openpyxl') as writer:
         df_db.to_excel(writer, sheet_name='DB_누적전체', index=False)
