@@ -3,235 +3,349 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+import sqlite3
+from datetime import datetime
 from io import BytesIO
+import os
 
+# ---------------------------------------------------------
+# Page Configuration
+# ---------------------------------------------------------
 st.set_page_config(
-    page_title="글로벌 법인별 원소재 가격 추이 모니터링",
+    page_title="글로벌 법인별 원소재 시세 Trend 누적 모니터링",
     page_icon="📈",
     layout="wide"
 )
 
+DB_PATH = "raw_materials_trend.db"
+
 # ---------------------------------------------------------
-# 1. 원소재 엑셀 데이터 파싱 함수 (원칙 기반 전처리)
+# 1. SQLite Database Initialization & Storage Engine
 # ---------------------------------------------------------
-@st.cache_data
-def load_and_parse_raw_material_data(file_source):
-    excel = pd.ExcelFile(file_source)
-    
-    # 요약 시트 파싱
-    df_raw = pd.read_excel(excel, sheet_name='요약_Summary', header=None)
-    
-    # 컬럼 정의: 
-    # 한국: 7월(col 4), 8월(col 8), 9월(col 12)
-    # 중국: 7월(col 16), 8월(col 20), 9월(col 24)
-    # 인도: 7월(col 28), 8월(col 32), 9월(col 36)
-    subsidiaries = {
-        '한국': {'7월': 4, '8월': 8, '9월': 12, 'currency': 'KRW'},
-        '중국': {'7월': 16, '8월': 20, '9월': 24, 'currency': 'CNY'},
-        '인도': {'7월': 28, '8월': 32, '9월': 36, 'currency': 'INR'}
-    }
-    
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS material_prices (
+            subsidiary TEXT,
+            category TEXT,
+            material TEXT,
+            grade TEXT,
+            month TEXT,
+            price REAL,
+            currency TEXT,
+            supplier TEXT,
+            memo TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (subsidiary, category, material, grade, month)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_to_db(df_records):
+    if df_records.empty:
+        return 0
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    count = 0
+    for _, row in df_records.iterrows():
+        cur.execute('''
+            INSERT INTO material_prices (
+                subsidiary, category, material, grade, month, price, currency, supplier, memo, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subsidiary, category, material, grade, month) DO UPDATE SET
+                price=excluded.price,
+                currency=excluded.currency,
+                supplier=excluded.supplier,
+                memo=excluded.memo,
+                updated_at=excluded.updated_at
+        ''', (
+            row['subsidiary'], row['category'], row['material'], row['grade'],
+            row['month'], row['price'], row['currency'], row['supplier'], row['memo'], now_str
+        ))
+        count += 1
+    conn.commit()
+    conn.close()
+    return count
+
+def load_data_from_db():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT * FROM material_prices ORDER BY category, material, grade, month", conn)
+    conn.close()
+    return df
+
+# ---------------------------------------------------------
+# 2. Excel Parsing Engine (요약 시트 + HS India Grades 시트)
+# ---------------------------------------------------------
+def parse_raw_material_excel(uploaded_file):
+    excel = pd.ExcelFile(uploaded_file)
     records = []
     
-    # Row 6부터 데이터 시작 (0-index 기준)
-    curr_category = ""
-    curr_material = ""
-    
-    for r in range(6, len(df_raw)):
-        # Category Forward Fill
-        raw_cat = df_raw.iloc[r, 1]
-        if pd.notna(raw_cat) and str(raw_cat).strip() != "":
-            curr_category = str(raw_cat).split('\n')[0].replace(' / ', '/').strip()
-            
-        # Material Forward Fill
-        raw_mat = df_raw.iloc[r, 2]
-        if pd.notna(raw_mat) and str(raw_mat).strip() != "":
-            curr_material = str(raw_mat).split('\n')[0].strip()
-        elif pd.isna(raw_mat) and curr_category in ['Cu(Kg)', 'LME', 'TTS', '황동원소재/Brass', 'Sn']:
-            curr_material = curr_category
-
-        grade = str(df_raw.iloc[r, 3]).strip() if pd.notna(df_raw.iloc[r, 3]) else '-'
+    # [A] 요약_Summary 시트 파싱
+    if '요약_Summary' in excel.sheet_names:
+        df_summary = pd.read_excel(excel, sheet_name='요약_Summary', header=None)
+        subs_map = {
+            '한국': {'7월': 4, '8월': 8, '9월': 12, 'default_curr': 'KRW'},
+            '중국': {'7월': 16, '8월': 20, '9월': 24, 'default_curr': 'CNY'},
+            '인도': {'7월': 28, '8월': 32, '9월': 36, 'default_curr': 'INR'}
+        }
         
-        # 품목 식별명 생성
-        item_name = f"[{curr_category}] {curr_material}" + (f" ({grade})" if grade != '-' else "")
-        
-        for sub, month_map in subsidiaries.items():
-            for m_name, col_idx in month_map.items():
-                if m_name == 'currency':
-                    continue
-                price = df_raw.iloc[r, col_idx]
-                curr = df_raw.iloc[r, col_idx + 1]
-                supplier = df_raw.iloc[r, col_idx + 2]
-                memo = df_raw.iloc[r, col_idx + 3]
+        curr_cat = ""
+        curr_mat = ""
+        for r in range(5, len(df_summary)):
+            c = df_summary.iloc[r, 1]
+            if pd.notna(c) and str(c).strip() != "":
+                curr_cat = str(c).split('\n')[0].replace(' / ', '/').strip()
                 
-                # 유효 숫자 검증
+            m = df_summary.iloc[r, 2]
+            if pd.notna(m) and str(m).strip() != "":
+                curr_mat = str(m).split('\n')[0].strip()
+            elif pd.isna(m):
+                curr_mat = curr_cat
+            
+            grade = str(df_summary.iloc[r, 3]).strip() if pd.notna(df_summary.iloc[r, 3]) else 'STD'
+            
+            for sub, m_info in subs_map.items():
+                for month_name in ['7월', '8월', '9월']:
+                    col_idx = m_info[month_name]
+                    price = df_summary.iloc[r, col_idx]
+                    curr = df_summary.iloc[r, col_idx + 1]
+                    supp = df_summary.iloc[r, col_idx + 2]
+                    memo = df_summary.iloc[r, col_idx + 3]
+                    
+                    try:
+                        p_val = float(price) if pd.notna(price) else None
+                    except (ValueError, TypeError):
+                        p_val = None
+                        
+                    records.append({
+                        'subsidiary': sub,
+                        'category': curr_cat,
+                        'material': curr_mat,
+                        'grade': grade,
+                        'month': month_name,
+                        'price': p_val,
+                        'currency': str(curr).strip() if pd.notna(curr) else m_info['default_curr'],
+                        'supplier': str(supp).strip() if pd.notna(supp) else '',
+                        'memo': str(memo).strip() if pd.notna(memo) else ''
+                    })
+
+    # [B] HS India Grades 시트 (인도 로컬 사출 엔프라 수지)
+    if 'HS India  Grades' in excel.sheet_names:
+        df_in = pd.read_excel(excel, sheet_name='HS India  Grades', header=None)
+        curr_cat = "사출원재료"
+        curr_mat = ""
+        for r in range(5, len(df_in)):
+            m = df_in.iloc[r, 2]
+            if pd.notna(m) and str(m).strip() != "":
+                curr_mat = str(m).split('\n')[0].strip()
+            grade = str(df_in.iloc[r, 3]).strip() if pd.notna(df_in.iloc[r, 3]) else 'STD'
+            if grade == 'nan' or not grade:
+                continue
+                
+            for month_name, col_idx in [('7월', 28), ('8월', 32), ('9월', 36)]:
+                price = df_in.iloc[r, col_idx]
+                curr = df_in.iloc[r, col_idx + 1]
+                supp = df_in.iloc[r, col_idx + 2]
+                memo = df_in.iloc[r, col_idx + 3]
+                
                 try:
-                    price_val = float(price) if pd.notna(price) else np.nan
-                except ValueError:
-                    price_val = np.nan
+                    p_val = float(price) if pd.notna(price) else None
+                except (ValueError, TypeError):
+                    p_val = None
                     
                 records.append({
-                    '법인': sub,
-                    '구분': curr_category,
-                    '재질': curr_material,
-                    'GRADE': grade,
-                    '품목명': item_name,
-                    '월': m_name,
-                    '단가': price_val,
-                    '통화': curr if pd.notna(curr) else month_map['currency'],
-                    '공급사명': str(supplier).strip() if pd.notna(supplier) else '',
-                    'Memo': str(memo).strip() if pd.notna(memo) else ''
+                    'subsidiary': '인도',
+                    'category': curr_cat,
+                    'material': curr_mat,
+                    'grade': grade,
+                    'month': month_name,
+                    'price': p_val,
+                    'currency': str(curr).strip() if pd.notna(curr) else 'INR',
+                    'supplier': str(supp).strip() if pd.notna(supp) else '',
+                    'memo': str(memo).strip() if pd.notna(memo) else ''
                 })
                 
-    df_result = pd.DataFrame(records)
-    return df_result
+    return pd.DataFrame(records)
 
 # ---------------------------------------------------------
-# 2. 메인 애플리케이션 레이아웃
+# 3. Main State Initialization & Auto-Seeding
 # ---------------------------------------------------------
-st.title("📊 글로벌 법인별 원소재 가격 추이 분석 대시보드")
-st.caption("자동차 모터용 주요 비철금속(Cu, Al, 황동), 사출수지 및 LME/환율 추이 통합 모니터링")
+init_db()
 
-# 사이드바: 파일 업로드 및 필터링
-st.sidebar.header("📁 데이터 소스 관리")
-uploaded_file = st.sidebar.file_uploader("원소재 엑셀 파일 업로드 (.xlsx)", type=["xlsx"])
+# 사이드바: 모바일 업로드
+st.sidebar.markdown("### 📱 모바일 데이터 업로드 & 누적")
+st.sidebar.info("사내망 보안 차단 시, 모바일로 접속해 엑셀을 업로드하면 DB에 자동 누적·갱신됩니다.")
 
+uploaded_file = st.sidebar.file_uploader("최신 원소재 엑셀 파일 (.xlsx)", type=["xlsx"])
 if uploaded_file is not None:
-    df_data = load_and_parse_raw_material_data(uploaded_file)
+    with st.spinner("엑셀 데이터 파싱 및 SQLite DB 누적 중..."):
+        parsed_df = parse_raw_material_excel(uploaded_file)
+        saved_cnt = save_to_db(parsed_df)
+        st.sidebar.success(f"총 {saved_cnt}건 누적 저장 완료!")
+
+# DB에서 누적 데이터 로드
+df_db = load_data_from_db()
+
+# DB가 비어있는 경우 로컬 기준 엑셀 자동 시드 (최초 1회)
+if df_db.empty:
+    for default_name in ["[인도법인]법인별 원소재 가격 추이_260930_KR-EN R1.xlsx", "raw_material_sample.xlsx"]:
+        if os.path.exists(default_name):
+            parsed_init = parse_raw_material_excel(default_name)
+            save_to_db(parsed_init)
+            df_db = load_data_from_db()
+            break
+
+# ---------------------------------------------------------
+# 4. 사이드바 필터 (재질별 드롭다운)
+# ---------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔍 시세 조회 조건 설정")
+
+if not df_db.empty:
+    # 1) 재질 드롭다운 (Selectbox)
+    available_materials = sorted([m for m in df_db['material'].dropna().unique() if m != ''])
+    selected_material = st.sidebar.selectbox(
+        "📌 재질(Material) 선택",
+        options=["전체 재질"] + available_materials,
+        index=0
+    )
+    
+    # 2) 대상 법인 다중 선택
+    available_subs = list(df_db['subsidiary'].unique())
+    selected_subs = st.sidebar.multiselect(
+        "🏢 대상 법인 선택",
+        options=available_subs,
+        default=[s for s in ['한국', '인도'] if s in available_subs]
+    )
+    
+    # 필터링 적용
+    mask = df_db['subsidiary'].isin(selected_subs)
+    if selected_material != "전체 재질":
+        mask = mask & (df_db['material'] == selected_material)
+    sub_filtered_df = df_db[mask]
+    
+    # 3) 세부 GRADE 필터
+    available_grades = sorted(sub_filtered_df['grade'].unique())
+    selected_grades = st.sidebar.multiselect(
+        "🏷️ GRADE 선택",
+        options=available_grades,
+        default=available_grades
+    )
+    
+    final_df = sub_filtered_df[sub_filtered_df['grade'].isin(selected_grades)].copy()
 else:
-    default_filename = "[인도법인]법인별 원소재 가격 추이_260930_KR-EN R1.xlsx"
-    try:
-        df_data = load_and_parse_raw_material_data(default_filename)
-        st.sidebar.success(f"기준 마스터 로드 완료: `{default_filename}`")
-    except Exception as e:
-        st.error(f"파일을 찾을 수 없습니다. 원본 엑셀 파일을 업로드해주세요. 에러: {e}")
-        st.stop()
+    final_df = pd.DataFrame()
 
 # ---------------------------------------------------------
-# 3. 중국 법인 미접수 상태 점검 및 경고 처리
+# 5. 메인 대시보드 화면
 # ---------------------------------------------------------
-cn_valid_count = df_data[(df_data['법인'] == '중국') & (df_data['단가'].notna())].shape[0]
+st.title("📊 글로벌 법인별 원소재 단가 Trend 분석")
+st.caption("소형 모터 주요 원자재(Cu, Al, 황동, 사출수지) 시계열 누적 모니터링")
 
-if cn_valid_count == 0:
-    st.warning("⚠️ **[구매 현황 공지]** 중국 법인의 당월/분기 원소재 단가는 **현재 미접수 상태**입니다. 수신 완료 시 엑셀 업데이트 후 재반영됩니다.")
-
-# 필터링 섹션
-st.sidebar.header("🔍 원소재 필터 조건")
-selected_subs = st.sidebar.multiselect("대상 법인", options=df_data['법인'].unique(), default=['한국', '인도'])
-selected_cats = st.sidebar.multiselect("원소재 구분", options=df_data['구분'].unique(), default=df_data['구분'].unique())
-
-filtered_df = df_data[(df_data['법인'].isin(selected_subs)) & (df_data['구분'].isin(selected_cats))]
-items_available = filtered_df['품목명'].unique()
-selected_items = st.sidebar.multiselect("상세 품목(재질/GRADE)", options=items_available, default=items_available[:4] if len(items_available) >= 4 else items_available)
-
-final_df = filtered_df[filtered_df['품목명'].isin(selected_items)]
+# 중국 법인 미접수 안내 배너
+if not df_db.empty:
+    cn_prices = df_db[(df_db['subsidiary'] == '중국') & (df_db['price'].notna())]
+    if cn_prices.empty:
+        st.warning("⚠️ **[구매 현황 공지] 중국 법인 원소재 단가는 현재 미접수 상태입니다.** 접수 후 모바일 업로드 시 즉시 통합 반영됩니다.")
 
 # ---------------------------------------------------------
-# 4. KPI 지표 (한국 및 인도 9월 MoM 변동 분석)
+# 6. Trend 꺾은선 그래프 (Line Chart)
 # ---------------------------------------------------------
-st.subheader("📌 9월 MoM(전월비) 주요 원소재 변동 현황")
+st.subheader(f"📈 {'[' + selected_material + ']' if selected_material != '전체 재질' else '원소재'} 단가 변동 Trend")
 
-kpi_cols = st.columns(4)
-cu_kr = df_data[(df_data['법인'] == '한국') & (df_data['구분'] == 'Cu(Kg)')]
-cu_in = df_data[(df_data['법인'] == '인도') & (df_data['구분'] == 'Cu(Kg)')]
-lme_data = df_data[(df_data['법인'] == '한국') & (df_data['구분'] == 'LME')]
-tts_data = df_data[(df_data['법인'] == '한국') & (df_data['구분'] == 'TTS')]
+valid_plot_df = final_df.dropna(subset=['price']).copy()
 
-def get_mom_metrics(sub_df):
-    p8 = sub_df[sub_df['월'] == '8월']['단가'].values
-    p9 = sub_df[sub_df['월'] == '9월']['단가'].values
-    if len(p8) > 0 and len(p9) > 0 and pd.notna(p8[0]) and pd.notna(p9[0]):
-        diff = p9[0] - p8[0]
-        pct = (diff / p8[0]) * 100
-        return p9[0], diff, pct
-    return None, None, None
-
-# Card 1: 한국 Cu
-p9, diff, pct = get_mom_metrics(cu_kr)
-if p9:
-    kpi_cols[0].metric("한국 Cu(Kg)", f"{p9:,.0f} KRW", f"{diff:+,.0f} ({pct:+.2f}%)")
-
-# Card 2: 인도 Cu (INR)
-p9, diff, pct = get_mom_metrics(cu_in)
-if p9:
-    kpi_cols[1].metric("인도 Cu(Kg)", f"{p9:,.2f} INR", f"{diff:+,.2f} ({pct:+.2f}%)")
-
-# Card 3: LME
-p9, diff, pct = get_mom_metrics(lme_data)
-if p9:
-    kpi_cols[2].metric("LME 동지표", f"${p9:,.2f}", f"{diff:+,.2f} ({pct:+.2f}%)")
-
-# Card 4: 환율 TTS
-p9, diff, pct = get_mom_metrics(tts_data)
-if p9:
-    kpi_cols[3].metric("원/달러 TTS", f"{p9:,.2f} KRW", f"{diff:+,.2f} ({pct:+.2f}%)")
+if not valid_plot_df.empty:
+    # 월 순서 정렬
+    month_order = {'7월': 1, '8월': 2, '9월': 3, '10월': 4, '11월': 5, '12월': 6}
+    valid_plot_df['month_rank'] = valid_plot_df['month'].map(lambda x: month_order.get(x, 99))
+    valid_plot_df = valid_plot_df.sort_values(by=['month_rank', 'subsidiary', 'material', 'grade'])
+    
+    # 선 식별 라벨
+    valid_plot_df['line_label'] = valid_plot_df.apply(
+        lambda r: f"[{r['subsidiary']}] {r['material']} | {r['grade']} ({r['currency']})", axis=1
+    )
+    
+    fig = px.line(
+        valid_plot_df,
+        x='month',
+        y='price',
+        color='line_label',
+        markers=True,
+        hover_data={
+            'subsidiary': True,
+            'material': True,
+            'grade': True,
+            'currency': True,
+            'supplier': True,
+            'memo': True,
+            'price': ':.2f',
+            'month': False,
+            'line_label': False
+        },
+        title=f"월별 단가 추이 모니터링 ({selected_material})"
+    )
+    
+    fig.update_layout(
+        xaxis_title="기준월 (Month)",
+        yaxis_title="단가 (각 법인 결제 통화 기준)",
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.5,
+            xanchor="center",
+            x=0.5
+        ),
+        margin=dict(l=40, r=40, t=50, b=100)
+    )
+    fig.update_traces(line=dict(width=2.5), marker=dict(size=8))
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("선택된 필터 조건에 표시할 유효 단가 데이터가 없습니다.")
 
 st.markdown("---")
 
 # ---------------------------------------------------------
-# 5. 시계열 단가 추이 차트 (Plotly Interactive)
+# 7. 세부 피벗 테이블 및 MoM(전월비) 변동률 산출
 # ---------------------------------------------------------
-st.subheader("📈 품목별 월별 단가 추이")
+st.subheader("📋 세부 단가 피벗 테이블 및 MoM(전월비) 분석")
 
 if not final_df.empty:
-    fig = px.line(
-        final_df.dropna(subset=['단가']),
-        x='월',
-        y='단가',
-        color='품목명',
-        line_dash='법인',
-        markers=True,
-        hover_data=['통화', '공급사명'],
-        title="법인별·원소재별 가격 변동 추이 (7월 ~ 9월)"
+    pivot_df = final_df.pivot_table(
+        index=['subsidiary', 'category', 'material', 'grade', 'currency', 'supplier'],
+        columns='month',
+        values='price',
+        aggfunc='first'
+    ).reset_index()
+    
+    cols = [c for c in ['7월', '8월', '9월'] if c in pivot_df.columns]
+    if len(cols) >= 2:
+        prev_m, curr_m = cols[-2], cols[-1]
+        pivot_df[f'MoM 증감 ({curr_m} vs {prev_m})'] = pivot_df[curr_m] - pivot_df[prev_m]
+        pivot_df['MoM 증감률(%)'] = ((pivot_df[curr_m] - pivot_df[prev_m]) / pivot_df[prev_m]) * 100
+        
+    st.dataframe(
+        pivot_df.style.format({
+            c: '{:,.2f}' for c in cols
+        } | {
+            f'MoM 증감 ({curr_m} vs {prev_m})': '{:+,.2f}',
+            'MoM 증감률(%)': '{:+.2f}%'
+        }, na_rep="-"),
+        use_container_width=True
     )
-    fig.update_layout(
-        hovermode="x unified",
-        xaxis_title="기준월",
-        yaxis_title="단가 (각 법인 통화 기준)",
-        legend=dict(orientation="h", yanchor="bottom", y=-0.5, xanchor="center", x=0.5)
-    )
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("선택된 필터 조건에 부합하는 데이터가 없습니다.")
-
-# ---------------------------------------------------------
-# 6. 원가 검증 및 데이터 테이블 (Pivot Table)
-# ---------------------------------------------------------
-st.subheader("📋 원소재 단가 세부 내역표 (Summary View)")
-
-# Pivot Table 생성
-pivot_df = final_df.pivot_table(
-    index=['법인', '구분', '재질', 'GRADE', '통화', '공급사명'],
-    columns='월',
-    values='단가',
-    aggfunc='first'
-).reset_index()
-
-# 7월, 8월, 9월 컬럼 순서 정렬 및 MoM 계산
-for col in ['7월', '8월', '9월']:
-    if col not in pivot_df.columns:
-        pivot_df[col] = np.nan
-
-pivot_df = pivot_df[['법인', '구분', '재질', 'GRADE', '통화', '공급사명', '7월', '8월', '9월']]
-pivot_df['MoM 증감률(%)'] = ((pivot_df['9월'] - pivot_df['8월']) / pivot_df['8월']) * 100
-
-st.dataframe(
-    pivot_df.style.format({
-        '7월': '{:,.2f}',
-        '8월': '{:,.2f}',
-        '9월': '{:,.2f}',
-        'MoM 증감률(%)': '{:+.2f}%'
-    }, na_rep="-"),
-    use_container_width=True
-)
-
-# 엑셀 다운로드 기능
-output = BytesIO()
-with pd.ExcelWriter(output, engine='openpyxl') as writer:
-    pivot_df.to_excel(writer, sheet_name='Price_Trend_Analysis', index=False)
-st.download_button(
-    label="📥 정제 분석 데이터 엑셀 다운로드",
-    data=output.getvalue(),
-    file_name="원소재_가격추이_분석_정리.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+    
+    # 엑셀 백업 다운로드
+    out_buf = BytesIO()
+    with pd.ExcelWriter(out_buf, engine='openpyxl') as writer:
+        df_db.to_excel(writer, sheet_name='DB_전체누적데이터', index=False)
+        pivot_df.to_excel(writer, sheet_name='현재조회_피벗요약', index=False)
+        
+    st.download_button(
+        label="📥 누적 원소재 마스터 DB 엑셀 다운로드 (백업)",
+        data=out_buf.getvalue(),
+        file_name=f"원소재_시세_누적마스터_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        mime="application/vnd
