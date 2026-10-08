@@ -13,40 +13,88 @@ from datetime import datetime
 # Page Configuration
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="글로벌 원소재 시세 Trend 대시보드",
-    page_icon="📈",
+    page_title="원소재 시세 Trend 모니터링 대시보드",
+    page_icon="📊",
     layout="wide"
 )
 
 DB_PATH = "raw_materials_trend.db"
 
 # ---------------------------------------------------------
-# 1. SQLite Database Storage Engine (자동 마이그레이션 포함)
+# 원소재 표준 마스터 정의 (지정 분류 체계)
+# ---------------------------------------------------------
+def match_master_material(cat, mat, grade):
+    text = f"{cat} {mat} {grade}".upper()
+    
+    # 3. 사출 원재료 세부 그레이드
+    if "JF1512" in text: return "3. 사출 원재료", "PP-TD20 (JF1512)"
+    if "JF1514" in text: return "3. 사출 원재료", "PP-TD+GF (JF1514G10)"
+    if "JF5513" in text: return "3. 사출 원재료", "PP-GF30% (JF5513)"
+    if "G-152" in text or "G152" in text: return "3. 사출 원재료", "PP-GF20 (G-152)"
+    if "G-153B" in text or "G153B" in text: return "3. 사출 원재료", "PP-GF30 (G-153B)"
+    if "JI350N" in text: return "3. 사출 원재료", "PP (JI350N)"
+    if "JI350G" in text: return "3. 사출 원재료", "PP (JI350G)"
+    if "KN333G30BL" in text or "KN333" in text: return "3. 사출 원재료", "PA66-GF30 (KN333G30BL)"
+    if "KP213G30BL" in text or "KP213" in text: return "3. 사출 원재료", "PBT-GF30 (KP213G30BL)"
+    if "LGP2200-BK" in text: return "3. 사출 원재료", "PP-GF20 (LGP2200-BK)"
+    if "LGP2200-NP" in text: return "3. 사출 원재료", "PP-GF20 (LGP2200-NP)"
+    if "LGP2100-NP" in text or "LGP2100" in text: return "3. 사출 원재료", "PP-GF10 (LGP2100-NP)"
+    
+    # 인도 로컬 사출 그레이드
+    if "HT840IN" in text: return "3. 사출 원재료", "PP-TD20 (HT840IN BK)"
+    if "HG940IN" in text: return "3. 사출 원재료", "PP-GF20 (HG940IN)"
+    if "FZ1140D5" in text: return "3. 사출 원재료", "PPS (FZ1140D5 NAT)"
+    if "ULTRADUR" in text: return "3. 사출 원재료", "PBT-GF30 (ULTRADUR B4300)"
+    if "RYNITE" in text: return "3. 사출 원재료", "PET+GF35 (RYNITE 935)"
+    if "ZYTEL" in text: return "3. 사출 원재료", "PA66+GF30 (ZYTEL)"
+    
+    # 4. 황동 원소재
+    if "C1100" in text or "황동" in text or "BRASS" in text:
+        return "4. 황동 원소재", "황동 C1100"
+        
+    # 2. ALDC 12
+    if "ALDC" in text or "알루미늄" in text or "ALUMINUM" in text:
+        return "2. ALDC 12", "ALDC 12"
+        
+    # 5. Sn
+    if "SN" in text or "주석" in text:
+        return "5. Sn", "Sn"
+        
+    # 1. Cu & 참고 지표
+    if "LME" in text:
+        return "6. 참고지표 (LME / TTS)", "LME 전기동"
+    if "TTS" in text:
+        return "6. 참고지표 (LME / TTS)", "환율 TTS"
+    if "CU" in text or "구리" in text or "동" in text:
+        return "1. Cu", "Cu"
+        
+    fallback_name = f"{mat} ({grade})" if grade and grade != 'STD' else (mat if mat else cat)
+    return "기타 원소재", fallback_name
+
+# ---------------------------------------------------------
+# 1. SQLite Database Storage Engine (누적 관리)
 # ---------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # 기존 구버전 스키마 체크 및 자동 갱신
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='material_prices'")
     if cur.fetchone():
         cur.execute("PRAGMA table_info(material_prices)")
         cols = [c[1] for c in cur.fetchall()]
-        if 'item_name' not in cols:
+        if 'std_category' not in cols:
             cur.execute("DROP TABLE material_prices")
             
     cur.execute('''
         CREATE TABLE IF NOT EXISTS material_prices (
             subsidiary TEXT,
-            category TEXT,
-            material TEXT,
-            grade TEXT,
-            item_name TEXT,
+            std_category TEXT,
+            material_name TEXT,
             month TEXT,
             price REAL,
             currency TEXT,
             supplier TEXT,
             updated_at TEXT,
-            PRIMARY KEY (subsidiary, item_name, month)
+            PRIMARY KEY (subsidiary, material_name, month)
         )
     ''')
     conn.commit()
@@ -67,19 +115,17 @@ def save_records_to_db(df_records):
             
         cur.execute('''
             INSERT INTO material_prices (
-                subsidiary, category, material, grade, item_name, month, price, currency, supplier, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(subsidiary, item_name, month) DO UPDATE SET
-                category=excluded.category,
-                material=excluded.material,
-                grade=excluded.grade,
+                subsidiary, std_category, material_name, month, price, currency, supplier, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subsidiary, material_name, month) DO UPDATE SET
+                std_category=excluded.std_category,
                 price=excluded.price,
                 currency=excluded.currency,
                 supplier=excluded.supplier,
                 updated_at=excluded.updated_at
         ''', (
-            str(row['법인']), str(row['구분']), str(row['재질']), str(row['GRADE']),
-            str(row['원소재품목']), str(row['월']), p_val, str(row['통화']),
+            str(row['법인']), str(row['std_category']), str(row['material_name']),
+            str(row['월']), p_val, str(row['통화']),
             str(row.get('공급사', '')), now_str
         ))
         count += 1
@@ -90,7 +136,7 @@ def save_records_to_db(df_records):
 def load_data_from_db():
     conn = sqlite3.connect(DB_PATH)
     try:
-        df = pd.read_sql_query("SELECT * FROM material_prices ORDER BY item_name, month", conn)
+        df = pd.read_sql_query("SELECT * FROM material_prices ORDER BY std_category, material_name, month", conn)
     except Exception:
         df = pd.DataFrame()
     finally:
@@ -98,7 +144,7 @@ def load_data_from_db():
     return df
 
 # ---------------------------------------------------------
-# 2. 초유연 엑셀 복사/붙여넣기 파서 (헤더 포함/미포함 모두 지원)
+# 2. 스마트 엑셀 복사/붙여넣기 파서
 # ---------------------------------------------------------
 def parse_smart_excel_clipboard(pasted_text, sub_default="한국", default_months=None):
     if default_months is None:
@@ -111,10 +157,8 @@ def parse_smart_excel_clipboard(pasted_text, sub_default="한국", default_month
     sep = '\t' if '\t' in pasted_text else ','
     rows = [[c.strip() for c in l.split(sep)] for l in lines]
 
-    # 1) '7월', '8월', '9월' 헤더가 포함되어 있는지 탐색
     month_row_idx = -1
     month_indices = []
-
     for r_idx, row in enumerate(rows[:5]):
         m_matches = []
         for c_idx, cell in enumerate(row):
@@ -128,7 +172,7 @@ def parse_smart_excel_clipboard(pasted_text, sub_default="한국", default_month
 
     records = []
 
-    # Case A: 헤더 행이 포함된 경우
+    # Case A: 월 헤더가 포함된 복사
     if month_row_idx != -1:
         data_start_idx = month_row_idx + 1
         if data_start_idx < len(rows) and any('단가' in c or 'Price' in c for c in rows[data_start_idx]):
@@ -146,10 +190,8 @@ def parse_smart_excel_clipboard(pasted_text, sub_default="한국", default_month
             elif not curr_mat and curr_cat:
                 curr_mat = curr_cat
 
-            grade = row[2] if len(row) > 2 and row[2] not in ['nan', '-', ''] else 'STD'
-            item_display = curr_mat if curr_mat == curr_cat else f"{curr_cat} {curr_mat}".strip()
-            if grade != 'STD':
-                item_display += f" ({grade})"
+            grade = row[2] if len(row) > 2 and row[2] not in ['nan', '-', ''] else ''
+            std_cat, std_mat = match_master_material(curr_cat, curr_mat, grade)
 
             for c_idx, m_name in month_indices:
                 p_val = None
@@ -170,22 +212,19 @@ def parse_smart_excel_clipboard(pasted_text, sub_default="한국", default_month
 
                 records.append({
                     '법인': sub_default,
-                    '구분': curr_cat if curr_cat else '원소재',
-                    '재질': curr_mat if curr_mat else '원소재',
-                    'GRADE': grade,
-                    '원소재품목': item_display,
+                    'std_category': std_cat,
+                    'material_name': std_mat,
                     '월': m_name,
                     '단가': p_val,
                     '통화': curr_str,
                     '공급사': supp_str
                 })
 
-    # Case B: 헤더 없이 순수 데이터 행만 복사한 경우 (현재 첨부 이미지 상황 대응)
+    # Case B: 순수 데이터 블록만 복사한 경우
     else:
         for row in rows:
             if not any(row):
                 continue
-            # 첫 번째 수치 단가 위치 탐색
             first_num_idx = -1
             for i, cell in enumerate(row):
                 clean = cell.replace(',', '').replace(' ', '')
@@ -201,12 +240,8 @@ def parse_smart_excel_clipboard(pasted_text, sub_default="한국", default_month
                 continue
 
             name_tokens = [c.split('/')[0].strip() for c in row[:first_num_idx] if c.strip()]
-            if len(name_tokens) == 1:
-                item_display = name_tokens[0]
-            elif len(name_tokens) >= 2:
-                item_display = f"{name_tokens[0]} ({name_tokens[1]})"
-            else:
-                item_display = "원소재"
+            c_text = " ".join(name_tokens)
+            std_cat, std_mat = match_master_material(c_text, "", "")
 
             val_part = row[first_num_idx:]
             idx = 0
@@ -231,10 +266,8 @@ def parse_smart_excel_clipboard(pasted_text, sub_default="한국", default_month
                     m_label = default_months[m_count] if m_count < len(default_months) else f"{m_count+1}차"
                     records.append({
                         '법인': sub_default,
-                        '구분': '원소재',
-                        '재질': item_display,
-                        'GRADE': 'STD',
-                        '원소재품목': item_display,
+                        'std_category': std_cat,
+                        'material_name': std_mat,
                         '월': m_label,
                         '단가': p_val,
                         '통화': curr,
@@ -271,13 +304,11 @@ def parse_raw_material_excel(uploaded_file):
             elif pd.isna(m):
                 curr_mat = curr_cat
 
-            grade = str(df_summary.iloc[r, 3]).strip() if pd.notna(df_summary.iloc[r, 3]) else 'STD'
-            if grade in ['nan', '-', '']:
-                grade = 'STD'
+            grade = str(df_summary.iloc[r, 3]).strip() if pd.notna(df_summary.iloc[r, 3]) else ''
+            if grade in ['nan', '-']:
+                grade = ''
 
-            item_display = curr_mat if curr_mat == curr_cat else f"{curr_cat} {curr_mat}".strip()
-            if grade != 'STD':
-                item_display += f" ({grade})"
+            std_cat, std_mat = match_master_material(curr_cat, curr_mat, grade)
 
             for sub, m_info in subs_map.items():
                 for month_name in ['7월', '8월', '9월']:
@@ -292,15 +323,46 @@ def parse_raw_material_excel(uploaded_file):
 
                     records.append({
                         '법인': sub,
-                        '구분': curr_cat,
-                        '재질': curr_mat,
-                        'GRADE': grade,
-                        '원소재품목': item_display,
+                        'std_category': std_cat,
+                        'material_name': std_mat,
                         '월': month_name,
                         '단가': p_val,
                         '통화': str(curr).strip() if pd.notna(curr) else m_info['default_curr'],
                         '공급사': str(supp).strip() if pd.notna(supp) else ''
                     })
+
+    if 'HS India  Grades' in excel.sheet_names:
+        df_in = pd.read_excel(excel, sheet_name='HS India  Grades', header=None)
+        curr_cat = "사출원재료"
+        curr_mat = ""
+        for r in range(5, len(df_in)):
+            m = df_in.iloc[r, 2]
+            if pd.notna(m) and str(m).strip() != "":
+                curr_mat = str(m).split('\n')[0].strip()
+            grade = str(df_in.iloc[r, 3]).strip() if pd.notna(df_in.iloc[r, 3]) else ''
+            if grade in ['nan', '-', '']:
+                continue
+
+            std_cat, std_mat = match_master_material(curr_cat, curr_mat, grade)
+
+            for month_name, col_idx in [('7월', 28), ('8월', 32), ('9월', 36)]:
+                price = df_in.iloc[r, col_idx]
+                curr = df_in.iloc[r, col_idx + 1]
+                supp = df_in.iloc[r, col_idx + 2]
+                try:
+                    p_val = float(price) if pd.notna(price) else None
+                except Exception:
+                    p_val = None
+
+                records.append({
+                    '법인': '인도',
+                    'std_category': std_cat,
+                    'material_name': std_mat,
+                    '월': month_name,
+                    '단가': p_val,
+                    '통화': str(curr).strip() if pd.notna(curr) else 'INR',
+                    '공급사': str(supp).strip() if pd.notna(supp) else ''
+                })
 
     return pd.DataFrame(records)
 
@@ -319,35 +381,23 @@ if df_db.empty:
             break
 
 # ---------------------------------------------------------
-# 5. 사이드바: 법인 / 원소재(전체 및 개별) / 기간 설정
+# 5. 사이드바: 법인 / 원소재 재질 드롭다운 / 기간 필터
 # ---------------------------------------------------------
 st.sidebar.markdown("## ⚙️ 시세 조회 설정")
 
-subs_options = ["전체 법인", "한국", "인도", "중국"]
-selected_sub = st.sidebar.selectbox("🏢 법인 선택", subs_options, index=0)
+subs_options = ["전체 법인 (비교)", "한국", "인도", "중국"]
+selected_sub_filter = st.sidebar.selectbox("🏢 법인 조회 범위", subs_options, index=0)
 
-if not df_db.empty:
-    if selected_sub != "전체 법인":
-        sub_df = df_db[df_db['subsidiary'] == selected_sub]
-    else:
-        sub_df = df_db.copy()
-else:
-    sub_df = pd.DataFrame()
+all_db_materials = sorted(df_db['material_name'].dropna().unique().tolist()) if not df_db.empty else []
+mat_options = ["전체 원소재 현황"] + all_db_materials
 
-# 1) 전체 원소재 현황 및 개별 품목 드롭다운
-item_options = ["전체 원소재 현황"]
-if not sub_df.empty:
-    available_items = sorted([str(i) for i in sub_df['item_name'].dropna().unique() if str(i).strip() != ''])
-    item_options.extend(available_items)
-
-selected_item = st.sidebar.selectbox(
-    "📌 원소재 선택 (드롭다운)",
-    options=item_options,
+selected_material = st.sidebar.selectbox(
+    "📌 원소재 재질 선택",
+    options=mat_options,
     index=0,
-    help="'전체 원소재 현황' 선택 시 Cu, AL, 사출수지 등 모든 소재의 누적 트렌드가 일괄 표시됩니다."
+    help="'전체 원소재 현황'을 선택하면 지정된 재질별로 개별 그래프가 나열되며, 각 그래프 내에 법인별 단가 추이가 표기됩니다."
 )
 
-# 2) 기간(월) 설정
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📅 조회 기간 설정")
 
@@ -368,32 +418,32 @@ if all_months:
 else:
     selected_months = []
 
-if not sub_df.empty and selected_months:
-    final_df = sub_df[sub_df['month'].isin(selected_months)].copy()
-    if selected_item != "전체 원소재 현황":
-        final_df = final_df[final_df['item_name'] == selected_item]
-else:
-    final_df = pd.DataFrame()
+working_df = df_db.copy()
+if selected_sub_filter != "전체 법인 (비교)":
+    working_df = working_df[working_df['subsidiary'] == selected_sub_filter]
+
+if selected_months:
+    working_df = working_df[working_df['month'].isin(selected_months)]
 
 # ---------------------------------------------------------
 # 6. 메인 화면: 엑셀 복사/붙여넣기 창
 # ---------------------------------------------------------
-st.title("📊 글로벌 원소재 단가 누적 Trend 분석 대시보드")
+st.title("📊 글로벌 원소재 단가 누적 Trend 모니터링")
 
 with st.expander("📋 사내 엑셀 단가표 복사·붙여넣기 (클릭하여 열기)", expanded=df_db.empty):
-    st.info("💡 **사용법**: 엑셀에서 표 영역을 복사(Ctrl+C)한 후 아래에 붙여넣기(Ctrl+V)하세요. 상단 헤더 포함 여부와 상관없이 자동 분석됩니다.")
+    st.info("💡 **사용법**: 사내 엑셀에서 단가 표 영역을 복사(Ctrl+C)한 후 아래에 붙여넣기(Ctrl+V)하세요.")
     p_sub = st.selectbox("붙여넣을 대상 법인", ["한국", "인도", "중국"], index=0)
-    pasted_text = st.text_area("엑셀 표 붙여넣기 창", height=130, placeholder="엑셀에서 복사한 영역을 여기에 붙여넣으세요...")
+    pasted_text = st.text_area("엑셀 표 붙여넣기 창", height=120, placeholder="엑셀 복사 데이터를 여기에 붙여넣으세요...")
     
     if st.button("🚀 데이터 반영 & DB 누적 저장"):
         if pasted_text.strip():
             parsed_df = parse_smart_excel_clipboard(pasted_text, sub_default=p_sub)
             if not parsed_df.empty:
                 cnt = save_records_to_db(parsed_df)
-                st.success(f"성공! 총 {cnt}건의 데이터가 정제되어 DB에 누적 저장되었습니다.")
+                st.success(f"총 {cnt}건의 원소재 시세 데이터가 정제되어 DB에 누적 저장되었습니다.")
                 st.rerun()
             else:
-                st.error("데이터 파싱 실패: 수치 단가 데이터가 포함되어 있는지 확인해주세요.")
+                st.error("데이터 파싱 실패: 복사한 데이터에 수치 단가가 포함되어 있는지 확인해주세요.")
         else:
             st.warning("붙여넣은 내용이 없습니다.")
 
@@ -403,60 +453,74 @@ if not df_db.empty:
         st.warning("⚠️ **[구매 현황 안내] 중국 법인 원소재 단가는 현재 미접수 상태입니다.** 데이터 접수 시 복사·붙여넣기하면 자동 누적됩니다.")
 
 # ---------------------------------------------------------
-# 7. Trend 꺾은선 그래프 (월별 순수 누적 트렌드)
+# 7. 재질별 개별 그래프 렌더링 (각 그래프 안에 법인별 라인)
 # ---------------------------------------------------------
-st.subheader(f"📈 [{selected_sub}] {selected_item} 단가 누적 Trend")
+st.subheader(f"📈 {selected_material} 단가 Trend (재질별 개별 그래프 & 법인별 비교)")
 
-valid_plot_df = final_df.dropna(subset=['price']).copy() if not final_df.empty else pd.DataFrame()
-
-if not valid_plot_df.empty:
-    valid_plot_df['month_rank'] = valid_plot_df['month'].map(lambda x: month_order.get(x, 99))
-    valid_plot_df = valid_plot_df.sort_values(by=['month_rank', 'subsidiary', 'item_name'])
-
-    if selected_sub == "전체 법인":
-        valid_plot_df['line_label'] = valid_plot_df.apply(
-            lambda r: f"[{r['subsidiary']}] {r['item_name']} ({r['currency']})", axis=1
-        )
-    else:
-        valid_plot_df['line_label'] = valid_plot_df.apply(
-            lambda r: f"{r['item_name']} ({r['currency']})", axis=1
-        )
-
-    fig = px.line(
-        valid_plot_df,
-        x='month',
-        y='price',
-        color='line_label',
-        markers=True,
-        hover_data={
-            'subsidiary': True,
-            'item_name': True,
-            'currency': True,
-            'supplier': True,
-            'price': ':.2f',
-            'month': False,
-            'line_label': False
-        }
-    )
-
-    fig.update_layout(
-        xaxis_title="",
-        yaxis_title="단가",
-        hovermode="x unified",
-        xaxis=dict(type='category', categoryorder='array', categoryarray=all_months),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=-0.5,
-            xanchor="center",
-            x=0.5
-        ),
-        margin=dict(l=40, r=40, t=30, b=120)
-    )
-    fig.update_traces(line=dict(width=2.5), marker=dict(size=7))
-    st.plotly_chart(fig, use_container_width=True)
+if selected_material == "전체 원소재 현황":
+    materials_to_show = sorted(working_df['material_name'].dropna().unique().tolist())
 else:
-    st.info("조회할 단가 데이터가 없습니다. 상단에서 엑셀 표를 복사·붙여넣기하거나 사이드바 필터를 확인해주세요.")
+    materials_to_show = [selected_material]
+
+sub_color_map = {
+    '한국': '#1f77b4',  # 파랑
+    '인도': '#2ca02c',  # 초록
+    '중국': '#ff7f0e'   # 주황
+}
+
+if materials_to_show and not working_df.empty:
+    for i in range(0, len(materials_to_show), 2):
+        row_mats = materials_to_show[i:i+2]
+        cols = st.columns(len(row_mats))
+        
+        for idx, mat_name in enumerate(row_mats):
+            mat_data = working_df[working_df['material_name'] == mat_name].dropna(subset=['price']).copy()
+            
+            with cols[idx]:
+                if not mat_data.empty:
+                    mat_data['month_rank'] = mat_data['month'].map(lambda x: month_order.get(x, 99))
+                    mat_data = mat_data.sort_values(by=['month_rank', 'subsidiary'])
+                    
+                    fig = px.line(
+                        mat_data,
+                        x='month',
+                        y='price',
+                        color='subsidiary',
+                        color_discrete_map=sub_color_map,
+                        markers=True,
+                        title=f"📌 {mat_name}",
+                        hover_data={
+                            'subsidiary': True,
+                            'currency': True,
+                            'supplier': True,
+                            'price': ':.2f',
+                            'month': False
+                        }
+                    )
+                    
+                    fig.update_layout(
+                        xaxis_title="",
+                        yaxis_title="단가",
+                        hovermode="x unified",
+                        xaxis=dict(type='category', categoryorder='array', categoryarray=all_months),
+                        legend=dict(
+                            orientation="h",
+                            yanchor="bottom",
+                            y=-0.35,
+                            xanchor="center",
+                            x=0.5,
+                            title=""
+                        ),
+                        margin=dict(l=30, r=30, t=50, b=60),
+                        height=360
+                    )
+                    fig.update_traces(line=dict(width=2.5), marker=dict(size=8))
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.markdown(f"**📌 {mat_name}**")
+                    st.info("해당 기간에 등록된 유효 단가 데이터가 없습니다.")
+else:
+    st.info("조회할 원소재 데이터가 없습니다. 상단에서 데이터를 붙여넣거나 필터 조건을 확인해주세요.")
 
 # ---------------------------------------------------------
 # 8. 세부 단가 피벗 테이블 및 MoM 증감율
@@ -464,9 +528,11 @@ else:
 st.markdown("---")
 st.subheader("📋 원소재별 세부 단가 및 MoM 변동 분석")
 
-if not final_df.empty:
-    pivot_df = final_df.pivot_table(
-        index=['subsidiary', 'item_name', 'currency', 'supplier'],
+display_table_df = working_df[working_df['material_name'].isin(materials_to_show)] if materials_to_show else pd.DataFrame()
+
+if not display_table_df.empty:
+    pivot_df = display_table_df.pivot_table(
+        index=['std_category', 'material_name', 'subsidiary', 'currency', 'supplier'],
         columns='month',
         values='price',
         aggfunc='first'
@@ -474,6 +540,7 @@ if not final_df.empty:
 
     active_m_cols = [m for m in all_months if m in pivot_df.columns and m in selected_months]
     format_dict = {m: '{:,.2f}' for m in active_m_cols}
+    
     if len(active_m_cols) >= 2:
         prev_m, curr_m = active_m_cols[-2], active_m_cols[-1]
         diff_col = f'MoM 증감 ({curr_m} vs {prev_m})'
@@ -488,7 +555,7 @@ if not final_df.empty:
     out_buf = io.BytesIO()
     with pd.ExcelWriter(out_buf, engine='openpyxl') as writer:
         df_db.to_excel(writer, sheet_name='DB_전체누적데이터', index=False)
-        pivot_df.to_excel(writer, sheet_name='조회_피벗요약', index=False)
+        pivot_df.to_excel(writer, sheet_name='피벗요약', index=False)
 
     st.download_button(
         label="📥 누적 원소재 마스터 엑셀 다운로드 (백업)",
